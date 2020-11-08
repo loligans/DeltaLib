@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"files.exclude": {
+			"**/*.vs": true,
+			"**/bin/**": true,
+			"**/obj/**": true
+		},
+		"versionlens.suggestions.showOnStartup": true,
+		"csharp.semanticHighlighting.enabled": true,
+		"omnisharp.enableEditorConfigSupport": true,
+		"omnisharp.enableImportCompletion": true,
+		"omnisharp.enableRoslynAnalyzers": true
+	},
+	"extensions": {
+		"recommendations": [
+			"ms-dotnettools.csharp",
+			"pflannery.vscode-versionlens",
+			"k--kato.docomment",
+			"Fudge.auto-using"
+		]
+	}
+}

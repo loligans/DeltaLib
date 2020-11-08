@@ -1,0 +1,5 @@
+root = true
+
+[*.cs]
+# CA2007: Do not directly await a Task
+dotnet_diagnostic.CA2007.severity = none
