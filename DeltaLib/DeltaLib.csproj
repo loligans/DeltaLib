@@ -1,11 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <PropertyGroup>
+  <PropertyGroup Label="Build Properties">
     <TargetFramework>net5.0</TargetFramework>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="System.IO.Pipelines" Version="4.7.3" />
+  <ItemGroup Label="Package References">
+    <PackageReference Include="System.IO.Pipelines" Version="5.0.0" />
   </ItemGroup>
 
 </Project>

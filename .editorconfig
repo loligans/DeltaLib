@@ -1,0 +1,3 @@
+[*.cs]
+# CA5350: Do Not Use Weak Cryptographic Algorithms
+dotnet_diagnostic.CA5350.severity = none

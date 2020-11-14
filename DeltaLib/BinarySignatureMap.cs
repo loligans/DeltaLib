@@ -4,32 +4,30 @@ using System.IO;
 using System.IO.Pipelines;
 using System.Threading.Tasks;
 using System.Threading;
-using System.Security.Cryptography;
-using System.Linq;
-using DeltaLib.Collections;
 using DeltaLib.Models;
-using System.Collections.ObjectModel;
-using System.Runtime.CompilerServices;
+using DeltaLib.Hashing;
+using System.Collections.Immutable;
+using System.Buffers;
+using System.Linq;
 
 namespace DeltaLib
 {
     public interface ISignatureMap
     {
-        int BlockCount();
-        ReadOnlyMemory<byte>? GetHash(int blockIndex);
-        int? GetBlockIndex(ReadOnlyMemory<byte> hash);
-
+        IReadOnlyDictionary<uint, HashSet<ReadOnlyMemory<byte>>> SignatureMappings { get; }
         /// <summary>
-        /// Creates a two-way mapping of block index and block hash.
+        /// Creates a two-way mapping between block index and block hash.
         /// </summary>
         /// <exception cref="ArgumentNullException"><paramref name="input"/> cannot be null.</exception>
         /// <exception cref="InvalidOperationException"><paramref name="input"/> must be readable.</exception>
-        public Task<ISignatureMap> CreateMap(Stream input, CancellationToken cancellationToken = default);
+        public Task<ISignatureMap> CreateMapAsync(Stream input, CancellationToken cancellationToken = default);
 
         /// <summary>
-        ///
+        /// Calculates a collection of <see cref="Delta" />'s using the specified <paramref name="comparer"/>.
         /// </summary>
-        public Task<IReadOnlyCollection<Delta>> CreateDelta(ISignatureMap comparer, CancellationToken cancellationToken = default);
+        /// <exception cref="ArgumentNullException"><paramref name="comparer"/> cannot be null.</exception>
+        /// <exception cref="InvalidOperationException">A mapping must exist on the instance of <see cref="ISignatureMap"/></exception>
+        public Task<IReadOnlyCollection<Delta>> CreateDeltaAsync(Stream input, CancellationToken cancellationToken = default);
     }
 
     /// <summary>
@@ -37,211 +35,191 @@ namespace DeltaLib
     /// </summary>
     public class BinarySignatureMap : ISignatureMap
     {
-        private readonly BidirectionalDictionary<int, ReadOnlyMemory<byte>> _signatureMapping;
-        public int BlockCount() => _signatureMapping.FirstKeys.Count;
-        public int BufferSize { get; init; } = 4194304;
-        public int MinimumReadSize { get; init; } = 4194304;
+        private readonly IHashingAlgorithm _hashingAlgorithm;
+        private readonly IRollingHashingAlgorithm _rollingChecksum;
+        private readonly Dictionary<uint, HashSet<ReadOnlyMemory<byte>>> _signatureMappings;
+        public IReadOnlyDictionary<uint, HashSet<ReadOnlyMemory<byte>>> SignatureMappings => _signatureMappings;
 
-        public BinarySignatureMap() : this(new BidirectionalDictionary<int, ReadOnlyMemory<byte>>()) { }
-        public BinarySignatureMap(BidirectionalDictionary<int, ReadOnlyMemory<byte>> signatureMapping)
+        public static readonly int BufferSize = 4 * 1024 * 1024;
+        public static readonly int BlockSize = 2048;
+
+        public BinarySignatureMap(
+            IHashingAlgorithm hashingAlgorithm,
+            IRollingHashingAlgorithm rollingChecksum,
+            Dictionary<uint, HashSet<ReadOnlyMemory<byte>>> signatureMappings) : this(hashingAlgorithm, rollingChecksum)
         {
-            if (signatureMapping is null) { throw new ArgumentNullException(nameof(signatureMapping)); }
-            if (   signatureMapping.FirstKeyComparer is not EqualityComparer<int>
-                || signatureMapping.SecondKeyComparer is not HashEqualityComparer)
-            {
-                _signatureMapping = new BidirectionalDictionary<int, ReadOnlyMemory<byte>>(
-                    signatureMapping,
-                    EqualityComparer<int>.Default,
-                    HashEqualityComparer.Default);
-            }
-            else
-            {
-                _signatureMapping = signatureMapping;
-            }
+            if (signatureMappings is null) { throw new ArgumentNullException(nameof(signatureMappings)); }
+            _signatureMappings = signatureMappings;
         }
 
-        public async Task<ISignatureMap> CreateMap(Stream input, CancellationToken cancellationToken = default)
+        public BinarySignatureMap(
+            IHashingAlgorithm hashingAlgorithm,
+            IRollingHashingAlgorithm rollingChecksum)
+        {
+            if (hashingAlgorithm is null) { throw new ArgumentNullException(nameof(hashingAlgorithm)); }
+            if (rollingChecksum is null) { throw new ArgumentNullException(nameof(rollingChecksum)); }
+
+            _hashingAlgorithm = hashingAlgorithm;
+            _rollingChecksum = rollingChecksum;
+            _signatureMappings ??= new Dictionary<uint, HashSet<ReadOnlyMemory<byte>>>();
+        }
+
+        public async Task<ISignatureMap> CreateMapAsync(Stream input, CancellationToken cancellationToken = default)
         {
             if (input is null) { throw new ArgumentNullException(nameof(input)); }
             if (input.CanRead is false) { throw new InvalidOperationException($"{nameof(input)} cannot be read"); }
 
-            var readerOptions = new StreamPipeReaderOptions(null, BufferSize, MinimumReadSize);
+            var readerOptions = new StreamPipeReaderOptions(null, BufferSize, BlockSize);
             var inputReader = PipeReader.Create(input, readerOptions);
 
-            // Calculate the hash of the Input
-            var blockIndex = 0;
-            ReadResult result;
-            do
+            // Start processing the pipe
+            ReadResult result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);;
+            ReadOnlySequence<byte> buffer;
+            long bufferLength;
+            ReadOnlySequence<byte> block;
+            while (!result.IsCompleted)
             {
-                // Get the next block of data
+                buffer = result.Buffer;
+                bufferLength = buffer.Length;
+                // Process the buffered data
+                long bufferIndex = 0;
+                do
+                {
+                    // Change the block size when we reach the the end of the pipe
+                    var blockSize = bufferIndex + BlockSize > bufferLength ? bufferLength - bufferIndex : BlockSize;
+
+                    // Calculate the checksum and hash using a slice of the buffer
+                    block = buffer.Slice(bufferIndex, blockSize);
+                    var checksum = _rollingChecksum.Calculate(ref block, (int)blockSize);
+                    var hash = _hashingAlgorithm.ComputeHash(ref block, (int)blockSize);
+
+                    // Prevent checksum collisions
+                    if (_signatureMappings.ContainsKey(checksum))
+                    {
+                        var hashSet = _signatureMappings[checksum];
+                        hashSet.Add(hash);
+                    }
+                    else
+                    {
+                        _signatureMappings.Add(checksum, new HashSet<ReadOnlyMemory<byte>> { hash });
+                    }
+
+                    bufferIndex += blockSize;
+                } while (bufferIndex < bufferLength);
+
+                // Advance to the reader to the next block
+                inputReader.AdvanceTo(result.Buffer.GetPosition(bufferIndex));
                 result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            }
 
-                // Store the hash and block index
-                var hash = ComputeHash(result.Buffer.FirstSpan);
-                _signatureMapping.Add(blockIndex, hash);
-
-                // Continue on to the next block
-                inputReader.AdvanceTo(result.Buffer.End);
-                blockIndex += 1;
-            } while (!result.IsCompleted);
-
+            // Close the file
             await inputReader.CompleteAsync().ConfigureAwait(false);
             return this;
         }
 
-        public async Task<IReadOnlyCollection<Delta>> CreateDelta(ISignatureMap comparer, CancellationToken cancellationToken = default)
+        public async Task<IReadOnlyCollection<Delta>> CreateDeltaAsync(Stream input, CancellationToken cancellationToken = default)
         {
-            var input = this;
-            if (input is null) { throw new InvalidOperationException("Cannot create delta when no signature map has been created."); }
-            if (comparer is null) { throw new ArgumentNullException(nameof(comparer), "Cannot create delta without a comparer map."); }
+            if (input is null) { throw new ArgumentNullException(nameof(input)); }
+            if (input.CanRead is false) { throw new InvalidOperationException($"{nameof(input)} cannot be read"); }
+            if (input.CanSeek is false) { throw new InvalidOperationException($"{nameof(input)} cannot seek"); }
 
-            return await Task.Run(() => {
-                var inputBlockCount = input.BlockCount();
-                var compareBlockCount = comparer.BlockCount();
-                var maxBlockCount = inputBlockCount > compareBlockCount ? inputBlockCount : compareBlockCount;
+            var readerOptions = new StreamPipeReaderOptions(null, BufferSize, BlockSize);
+            var inputReader = PipeReader.Create(input, readerOptions);
+            var deltas = new List<Delta>();
 
-                var deltas = new List<Delta>();
-                bool isCopy, isWrite, isDelete;
-                int source;
-                IEnumerable<Delta> blockDeltas;
-                var handledBlocks = new HashSet<int>(maxBlockCount);
-
-                for (var i = 0; i < maxBlockCount; i++)
+            ReadResult result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
+            ReadOnlySequence<byte> buffer;
+            long bufferLength;
+            long bufferThreshold;
+            long position = 0;
+            long lastMatch;
+            uint checksum = 0;
+            // Process the buffer until there is nothing left
+            while (result.Buffer.Length > 0)
+            {
+                buffer = result.Buffer;
+                bufferLength = result.Buffer.Length;
+                bufferThreshold = bufferLength < BlockSize ? bufferLength : bufferLength - BlockSize;
+                bool recalculate = true;
+                long bufferIndex = 0;
+                long blockSize;
+                ReadOnlySequence<byte> checksumBlock;
+                long missingPosition = 0;
+                while (bufferIndex < bufferThreshold)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
+                    // Use the correct block size when we reach the the end of the PipeReader
+                    blockSize = bufferIndex + BlockSize >= bufferLength
+                        ? bufferLength - bufferIndex
+                        : BlockSize;
 
-                    (isCopy, blockDeltas) = IsCopy(i, input, comparer, handledBlocks);
-                    if (isCopy)
+                    // Update checksum
+                    if (recalculate)
                     {
-                        deltas.AddRange(blockDeltas);
+                        checksumBlock = buffer.Slice(bufferIndex, blockSize);
+                        checksum = _rollingChecksum.Calculate(ref checksumBlock, (int)blockSize);
+                        recalculate = false;
+                    }
+                    else
+                    {
+                        checksumBlock = buffer.Slice(bufferIndex - 1, blockSize + 1);
+                        checksum = _rollingChecksum.Rotate(ref checksumBlock, checksum, (int)blockSize);
+                    }
+
+                    // This block exists in the _signatureMapping
+                    if (_signatureMappings.ContainsKey(checksum))
+                    {
+                        // Validate Hash
+                        var hashSet = _signatureMappings[checksum];
+
+                        var block = buffer.Slice(bufferIndex, blockSize);
+                        var blockHash = _hashingAlgorithm.ComputeHash(ref block, (int)blockSize);
+
+                        var isEqual = hashSet.Contains(blockHash, HashEqualityComparer.Default);
+                        if (isEqual)
+                        {
+                            // Insert Missing Data Previously
+                            if (missingPosition > 0)
+                            {
+                                Console.WriteLine($"Missing data: {missingPosition} Bytes: {position - missingPosition}");
+                            }
+
+                            // Insert Matched Data
+                            lastMatch = position;
+                            position += blockSize;
+                            deltas.Add(new Delta {
+                                Checksum = checksum,
+                                Target = lastMatch,
+                                Length = position
+                            });
+                            recalculate = true;
+                            bufferIndex += blockSize;
+                            missingPosition = 0;
+                            continue;
+                        }
+                    }
+                    // The last block in the file does not match
+                    else if (bufferThreshold == bufferLength)
+                    {
+                        Console.WriteLine($"Missing data: {position} Bytes: {bufferLength}");
+                        bufferIndex += blockSize;
+                        position += blockSize;
                         continue;
                     }
 
-                    // (isWrite, source, blockDeltas) = IsWrite(i, input, comparer);
-                    // if (isWrite)
-                    // {
-                    //     deltas.AddRange(blockDeltas ?? Array.Empty<Delta>());
-                    //     continue;
-                    // }
-
-                    // (isDelete, blockDeltas) = IsDelete(i, input, comparer);
-                    // if (isDelete)
-                    // {
-                    //     deltas.AddRange(blockDeltas ?? Array.Empty<Delta>());
-                    //     continue;
-                    // }
+                    // Store the position of missing data
+                    missingPosition = missingPosition > 0 ? missingPosition : position;
+                    bufferIndex += 1;
+                    position += 1;
                 }
 
-                return new ReadOnlyCollection<Delta>(deltas) as IReadOnlyCollection<Delta>;
-            }).ConfigureAwait(false);
-        }
-
-        public ReadOnlyMemory<byte>? GetHash(int blockIndex)
-        {
-            var exists = _signatureMapping.TryGetValue(blockIndex, out var result);
-            return exists ? result : null;
-        }
-
-        public int? GetBlockIndex(ReadOnlyMemory<byte> hash)
-        {
-            var exists = _signatureMapping.Reverse.TryGetValue(hash, out var result);
-            return exists ? result : null;
-        }
-
-        private static (bool, IEnumerable<Delta>) IsCopy(int blockIndex, ISignatureMap input, ISignatureMap comparer, ISet<int> handled)
-        {
-            var deltas = new List<Delta>();
-            var inputHash = input.GetHash(blockIndex);
-            var comparerHash = comparer.GetHash(blockIndex);
-
-            // Invalid Operation
-            if (inputHash is null && comparerHash is null)
-            {
-                return (false, deltas);
+                // Advance the read to the next block
+                inputReader.AdvanceTo(buffer.GetPosition(bufferIndex), buffer.End);
+                result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            // comparerMap is larger (Delete Operation)
-            if (inputHash is null)
-            {
-                return (false, deltas);
-            }
-
-            // inputMap is larger
-            if (comparerHash is null)
-            {
-                // Data was copied to another spot
-                var existingBlockIndex = comparer.GetBlockIndex(inputHash.Value);
-                if (existingBlockIndex is not null && !handled.Contains(blockIndex))
-                {
-                    deltas.Add(new Delta {
-                        OperationType = DeltaOperationType.Copy,
-                        TargetBlockIndex = blockIndex,
-                        SourceBlockIndex = existingBlockIndex.Value
-                    });
-                    handled.Add(blockIndex);
-
-                    return (true, deltas);
-                }
-            }
-
-            // inputMap and comparerMap have the same hash
-            if (inputHash.Value.Span.SequenceEqual(comparerHash!.Value.Span))
-            {
-                return (false, deltas);
-            }
-
-            var comparerBlock = comparer.GetBlockIndex(inputHash.Value);
-            var inputBlock = input.GetBlockIndex(comparerHash.Value);
-
-            // input contains new data (Write Operation)
-            if (inputBlock is null && comparerBlock is null)
-            {
-                return (false, deltas);
-            }
-
-            // comparer contains inputHash
-            if (comparerBlock is not null && !handled.Contains(blockIndex))
-            {
-                deltas.Add(new Delta {
-                    OperationType = DeltaOperationType.Copy,
-                    TargetBlockIndex = blockIndex,
-                    SourceBlockIndex = comparerBlock.Value
-                });
-                handled.Add(blockIndex);
-            }
-
-            // input contains comparerHash
-            if (inputBlock is not null && !handled.Contains(inputBlock.Value))
-            {
-                deltas.Add(new Delta {
-                    OperationType = DeltaOperationType.Copy,
-                    TargetBlockIndex = inputBlock.Value,
-                    SourceBlockIndex = blockIndex
-                });
-                handled.Add(inputBlock.Value);
-            }
-
-            return (true, deltas);
-        }
-
-        // private static (bool, int, IEnumerable<Delta>) IsWrite(int blockIndex, ISignatureMapOld input, ISignatureMapOld comparer, ISet<int> handled)
-        // {
-        //     var deltas = new List<Delta>();
-        //     return (false, 1, deltas);
-        //     //return input.SequenceEqual(comparer);
-        // }
-
-        // private static (bool, IEnumerable<Delta>) IsDelete(int blockIndex, ISignatureMapOld input, ISignatureMapOld comparer, ISet<int> handled)
-        // {
-        //     var deltas = new List<Delta>();
-        //     return (false, deltas);
-        //     //return input.SequenceEqual(comparer);
-        // }
-
-        private static ReadOnlyMemory<byte> ComputeHash(ReadOnlySpan<byte> buffer)
-        {
-            var hash = SHA384.HashData(buffer);
-            return new ReadOnlyMemory<byte>(hash);
+            // Close the file
+            await inputReader.CompleteAsync().ConfigureAwait(false);
+            return deltas.ToImmutableList();
         }
     }
 }

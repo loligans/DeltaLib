@@ -1,18 +1,20 @@
 
+using System;
+
 namespace DeltaLib.Models
 {
     public record Delta
     {
         public DeltaOperationType OperationType { get; init; }
-        public int TargetBlockIndex { get; init; }
-        public int SourceBlockIndex { get; init; }
+        public ReadOnlyMemory<byte>? Data { get; init; }
+        public uint Checksum { get; init; }
+        public long Target { get; init; }
+        public long Length { get; init; }
     }
 
     public enum DeltaOperationType
     {
-        Copy = 1,
-        Write = 2,
-        Delete = 3
+        Copy = 0,
+        Write = 1
     }
-
 }
