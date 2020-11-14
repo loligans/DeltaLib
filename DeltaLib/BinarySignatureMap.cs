@@ -16,17 +16,17 @@ namespace DeltaLib
     {
         IReadOnlyDictionary<uint, HashSet<ReadOnlyMemory<byte>>> SignatureMappings { get; }
         /// <summary>
-        /// Creates a two-way mapping between block index and block hash.
+        /// Creates a map for the specified <paramref name="input"/>.
         /// </summary>
-        /// <exception cref="ArgumentNullException"><paramref name="input"/> cannot be null.</exception>
-        /// <exception cref="InvalidOperationException"><paramref name="input"/> must be readable.</exception>
+        /// <exception cref="ArgumentNullException"><paramref name="input"/> is null.</exception>
+        /// <exception cref="InvalidOperationException"><paramref name="input"/> is unreadable.</exception>
         public Task<ISignatureMap> CreateMapAsync(Stream input, CancellationToken cancellationToken = default);
 
         /// <summary>
-        /// Calculates a collection of <see cref="Delta" />'s using the specified <paramref name="comparer"/>.
+        /// Creates deltas for the specified <paramref name="input"/>
         /// </summary>
-        /// <exception cref="ArgumentNullException"><paramref name="comparer"/> cannot be null.</exception>
-        /// <exception cref="InvalidOperationException">A mapping must exist on the instance of <see cref="ISignatureMap"/></exception>
+        /// <exception cref="ArgumentNullException">Either <paramref name="input"/> or <see cref="SignatureMappings"/> is null.</exception>
+        /// <exception cref="InvalidOperationException"><paramref name="input"/> is unreadable./></exception>
         public Task<IReadOnlyCollection<Delta>> CreateDeltaAsync(Stream input, CancellationToken cancellationToken = default);
     }
 
@@ -121,38 +121,44 @@ namespace DeltaLib
         {
             if (input is null) { throw new ArgumentNullException(nameof(input)); }
             if (input.CanRead is false) { throw new InvalidOperationException($"{nameof(input)} cannot be read"); }
-            if (input.CanSeek is false) { throw new InvalidOperationException($"{nameof(input)} cannot seek"); }
 
             var readerOptions = new StreamPipeReaderOptions(null, BufferSize, BlockSize);
             var inputReader = PipeReader.Create(input, readerOptions);
             var deltas = new List<Delta>();
 
+            // Grab the bufferLength
             ReadResult result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
-            ReadOnlySequence<byte> buffer;
-            long bufferLength;
+            ReadOnlySequence<byte> buffer = result.Buffer;
+            long bufferLength = buffer.Length;
+
             long bufferThreshold;
             long position = 0;
             long lastMatch;
             uint checksum = 0;
+
             // Process the buffer until there is nothing left
-            while (result.Buffer.Length > 0)
+            while (bufferLength > 0)
             {
+                // Update the buffer on each read
                 buffer = result.Buffer;
                 bufferLength = result.Buffer.Length;
-                bufferThreshold = bufferLength < BlockSize ? bufferLength : bufferLength - BlockSize;
+
                 bool recalculate = true;
                 long bufferIndex = 0;
                 long blockSize;
                 ReadOnlySequence<byte> checksumBlock;
                 long missingPosition = 0;
+
+                // Give a little room in the buffer so that it can transition into the next block
+                bufferThreshold = bufferLength < BlockSize ? bufferLength : bufferLength - BlockSize;
                 while (bufferIndex < bufferThreshold)
                 {
-                    // Use the correct block size when we reach the the end of the PipeReader
+                    // Ensure the correct block size is used when the buffer is at the end of the PipeReader
                     blockSize = bufferIndex + BlockSize >= bufferLength
                         ? bufferLength - bufferIndex
                         : BlockSize;
 
-                    // Update checksum
+                    // Update the checksum
                     if (recalculate)
                     {
                         checksumBlock = buffer.Slice(bufferIndex, blockSize);
@@ -165,15 +171,15 @@ namespace DeltaLib
                         checksum = _rollingChecksum.Rotate(ref checksumBlock, checksum, (int)blockSize);
                     }
 
-                    // This block exists in the _signatureMapping
+                    // Validate the checksum exists in _signatureMapping
                     if (_signatureMappings.ContainsKey(checksum))
                     {
-                        // Validate Hash
-                        var hashSet = _signatureMappings[checksum];
-
+                        // Calculate the buffer's hash value
                         var block = buffer.Slice(bufferIndex, blockSize);
                         var blockHash = _hashingAlgorithm.ComputeHash(ref block, (int)blockSize);
-
+                        
+                        // Validate the hash values match
+                        var hashSet = _signatureMappings[checksum];
                         var isEqual = hashSet.Contains(blockHash, HashEqualityComparer.Default);
                         if (isEqual)
                         {
@@ -197,7 +203,7 @@ namespace DeltaLib
                             continue;
                         }
                     }
-                    // The last block in the file does not match
+                    // Special Case: The last block in the file does not match
                     else if (bufferThreshold == bufferLength)
                     {
                         Console.WriteLine($"Missing data: {position} Bytes: {bufferLength}");
@@ -212,7 +218,7 @@ namespace DeltaLib
                     position += 1;
                 }
 
-                // Advance the read to the next block
+                // Advance the inputReader to the next block
                 inputReader.AdvanceTo(buffer.GetPosition(bufferIndex), buffer.End);
                 result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
             }
