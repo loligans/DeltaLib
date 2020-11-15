@@ -14,7 +14,7 @@ namespace DeltaLib
 {
     public interface ISignatureMap
     {
-        IReadOnlyDictionary<uint, HashSet<ReadOnlyMemory<byte>>> SignatureMappings { get; }
+        IReadOnlyDictionary<uint, HashSet<Signature>> SignatureMappings { get; }
         /// <summary>
         /// Creates a map for the specified <paramref name="input"/>.
         /// </summary>
@@ -37,16 +37,16 @@ namespace DeltaLib
     {
         private readonly IHashingAlgorithm _hashingAlgorithm;
         private readonly IRollingHashingAlgorithm _rollingChecksum;
-        private readonly Dictionary<uint, HashSet<ReadOnlyMemory<byte>>> _signatureMappings;
-        public IReadOnlyDictionary<uint, HashSet<ReadOnlyMemory<byte>>> SignatureMappings => _signatureMappings;
+        private readonly Dictionary<uint, HashSet<Signature>> _signatureMappings;
+        public IReadOnlyDictionary<uint, HashSet<Signature>> SignatureMappings => _signatureMappings;
 
-        public static readonly int BufferSize = 4 * 1024 * 1024;
-        public static readonly int BlockSize = 2048;
+        public int BufferSize { get; init; }
+        public int BlockSize { get; init; }
 
         public BinarySignatureMap(
             IHashingAlgorithm hashingAlgorithm,
             IRollingHashingAlgorithm rollingChecksum,
-            Dictionary<uint, HashSet<ReadOnlyMemory<byte>>> signatureMappings) : this(hashingAlgorithm, rollingChecksum)
+            Dictionary<uint, HashSet<Signature>> signatureMappings) : this(hashingAlgorithm, rollingChecksum)
         {
             if (signatureMappings is null) { throw new ArgumentNullException(nameof(signatureMappings)); }
             _signatureMappings = signatureMappings;
@@ -61,7 +61,7 @@ namespace DeltaLib
 
             _hashingAlgorithm = hashingAlgorithm;
             _rollingChecksum = rollingChecksum;
-            _signatureMappings ??= new Dictionary<uint, HashSet<ReadOnlyMemory<byte>>>();
+            _signatureMappings ??= new Dictionary<uint, HashSet<Signature>>(EqualityComparer<uint>.Default);
         }
 
         public async Task<ISignatureMap> CreateMapAsync(Stream input, CancellationToken cancellationToken = default)
@@ -73,10 +73,12 @@ namespace DeltaLib
             var inputReader = PipeReader.Create(input, readerOptions);
 
             // Start processing the pipe
+            long position = 0;
             ReadResult result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);;
             ReadOnlySequence<byte> buffer;
             long bufferLength;
             ReadOnlySequence<byte> block;
+            Signature signature;
             while (!result.IsCompleted)
             {
                 buffer = result.Buffer;
@@ -92,23 +94,31 @@ namespace DeltaLib
                     block = buffer.Slice(bufferIndex, blockSize);
                     var checksum = _rollingChecksum.Calculate(ref block, (int)blockSize);
                     var hash = _hashingAlgorithm.ComputeHash(ref block, (int)blockSize);
+                    signature = new()
+                    {
+                        Hash = hash,
+                        Checksum = checksum,
+                        Target = position,
+                        Length = blockSize
+                    };
 
                     // Prevent checksum collisions
                     if (_signatureMappings.ContainsKey(checksum))
                     {
                         var hashSet = _signatureMappings[checksum];
-                        hashSet.Add(hash);
+                        hashSet.Add(signature);
                     }
                     else
                     {
-                        _signatureMappings.Add(checksum, new HashSet<ReadOnlyMemory<byte>> { hash });
+                        _signatureMappings.Add(checksum, new HashSet<Signature>(SignatureEqualityComparer.Default) { signature });
                     }
 
                     bufferIndex += blockSize;
+                    position += blockSize;
                 } while (bufferIndex < bufferLength);
 
                 // Advance to the reader to the next block
-                inputReader.AdvanceTo(result.Buffer.GetPosition(bufferIndex));
+                inputReader.AdvanceTo(buffer.GetPosition(bufferIndex));
                 result = await inputReader.ReadAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -131,10 +141,12 @@ namespace DeltaLib
             ReadOnlySequence<byte> buffer = result.Buffer;
             long bufferLength = buffer.Length;
 
+            Signature signature;
+            Delta delta;
             long bufferThreshold;
             long position = 0;
-            long lastMatch;
             uint checksum = 0;
+            long missingPosition = -1;
 
             // Process the buffer until there is nothing left
             while (bufferLength > 0)
@@ -147,10 +159,9 @@ namespace DeltaLib
                 long bufferIndex = 0;
                 long blockSize;
                 ReadOnlySequence<byte> checksumBlock;
-                long missingPosition = 0;
 
                 // Give a little room in the buffer so that it can transition into the next block
-                bufferThreshold = bufferLength < BlockSize ? bufferLength : bufferLength - BlockSize;
+                bufferThreshold = bufferLength <= BlockSize ? bufferLength : bufferLength - BlockSize;
                 while (bufferIndex < bufferThreshold)
                 {
                     // Ensure the correct block size is used when the buffer is at the end of the PipeReader
@@ -177,29 +188,56 @@ namespace DeltaLib
                         // Calculate the buffer's hash value
                         var block = buffer.Slice(bufferIndex, blockSize);
                         var blockHash = _hashingAlgorithm.ComputeHash(ref block, (int)blockSize);
-                        
+                        signature = new() { Hash = blockHash, Checksum = checksum };
+
                         // Validate the hash values match
                         var hashSet = _signatureMappings[checksum];
-                        var isEqual = hashSet.Contains(blockHash, HashEqualityComparer.Default);
+                        var isEqual = hashSet.Contains(signature);
                         if (isEqual)
                         {
+                            hashSet.TryGetValue(signature, out signature!);
+
                             // Insert Missing Data Previously
-                            if (missingPosition > 0)
+                            if (missingPosition >= 0)
                             {
                                 Console.WriteLine($"Missing data: {missingPosition} Bytes: {position - missingPosition}");
+                                var missing = position - missingPosition;
+                                missing = missing < blockSize ? blockSize : missing;
+                                var buff = buffer.Slice(missingPosition, missing);
+                                deltas.Add(new()
+                                {
+                                    OperationType = DeltaOperationType.Write,
+                                    Data = buff.First,
+                                    Hash = _hashingAlgorithm.ComputeHash(ref buff, (int)missing),
+                                    Checksum = _rollingChecksum.Calculate(ref buff, (int)missing),
+                                    Target = missingPosition,
+                                    Length = signature.Target - missingPosition
+                                });
+                                missingPosition = -1;
+                            }
+                            // Nothing changed
+                            if (signature.Target == position)
+                            {
+                                position += blockSize;
+                                recalculate = true;
+                                bufferIndex += blockSize;
+                                continue;
                             }
 
-                            // Insert Matched Data
-                            lastMatch = position;
+                            // Data moved somewhere else
+                            //deltas.Add(new()
+                            //{
+                            //    OperationType = DeltaOperationType.Copy,
+                            //    Data = null,
+                            //    Hash = signature.Hash,
+                            //    Checksum = signature.Checksum,
+                            //    Source = signature.Target,
+                            //    Target = position,
+                            //    Length = blockSize
+                            //});
                             position += blockSize;
-                            deltas.Add(new Delta {
-                                Checksum = checksum,
-                                Target = lastMatch,
-                                Length = position
-                            });
                             recalculate = true;
                             bufferIndex += blockSize;
-                            missingPosition = 0;
                             continue;
                         }
                     }
@@ -207,15 +245,34 @@ namespace DeltaLib
                     else if (bufferThreshold == bufferLength)
                     {
                         Console.WriteLine($"Missing data: {position} Bytes: {bufferLength}");
+                        missingPosition = bufferIndex;
                         bufferIndex += blockSize;
-                        position += blockSize;
                         continue;
                     }
 
                     // Store the position of missing data
-                    missingPosition = missingPosition > 0 ? missingPosition : position;
+                    missingPosition = missingPosition > -1 ? missingPosition : bufferIndex;
                     bufferIndex += 1;
                     position += 1;
+                }
+
+                // Insert Missing Data Previously
+                if (missingPosition >= 0)
+                {
+                    Console.WriteLine($"Missing data: {missingPosition} Bytes: {position - missingPosition}");
+                    var length = bufferIndex - missingPosition;
+                    var buff = buffer.Slice(missingPosition, length);
+                    deltas.Add(new()
+                    {
+
+                        OperationType = DeltaOperationType.Delete,
+                        Data = buff.First,
+                        Hash = _hashingAlgorithm.ComputeHash(ref buff, (int)length),
+                        Checksum = _rollingChecksum.Calculate(ref buff, (int)length),
+                        Target = position - missingPosition,
+                        Length = length
+                    });
+                    missingPosition = -1;
                 }
 
                 // Advance the inputReader to the next block
