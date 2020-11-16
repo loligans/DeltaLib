@@ -9,6 +9,7 @@ using DeltaLib.Hashing;
 using System.Collections.Immutable;
 using System.Buffers;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace DeltaLib
 {
@@ -158,6 +159,7 @@ namespace DeltaLib
                 bool recalculate = true;
                 long bufferIndex = 0;
                 long blockSize;
+                long offset = 0;
                 ReadOnlySequence<byte> checksumBlock;
 
                 // Give a little room in the buffer so that it can transition into the next block
@@ -200,19 +202,18 @@ namespace DeltaLib
                             // Insert Missing Data Previously
                             if (missingPosition >= 0)
                             {
-                                Console.WriteLine($"Missing data: {missingPosition} Bytes: {position - missingPosition}");
                                 var missing = position - missingPosition;
-                                missing = missing < blockSize ? blockSize : missing;
-                                var buff = buffer.Slice(missingPosition, missing);
+                                var missingBuffer = buffer.Slice(missingPosition, missing);
                                 deltas.Add(new()
                                 {
                                     OperationType = DeltaOperationType.Write,
-                                    Data = buff.First,
-                                    Hash = _hashingAlgorithm.ComputeHash(ref buff, (int)missing),
-                                    Checksum = _rollingChecksum.Calculate(ref buff, (int)missing),
-                                    Target = missingPosition,
-                                    Length = signature.Target - missingPosition
+                                    Data = missingBuffer.First,
+                                    Hash = _hashingAlgorithm.ComputeHash(ref missingBuffer, (int)missing),
+                                    Checksum = _rollingChecksum.Calculate(ref missingBuffer, (int)missing),
+                                    Target = missingPosition + offset,
+                                    Length = (signature.Target - offset) - missingPosition
                                 });
+                                offset = (signature.Target - missingPosition) - (missingBuffer.Length);
                                 missingPosition = -1;
                             }
                             // Nothing changed
@@ -283,6 +284,19 @@ namespace DeltaLib
             // Close the file
             await inputReader.CompleteAsync().ConfigureAwait(false);
             return deltas.ToImmutableList();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static long RoundUp(long input, long multiple)
+        {
+            if (multiple == 0)
+                return input;
+
+            long remainder = input % multiple;
+            if (remainder == 0)
+                return input;
+
+            return input + multiple - remainder;
         }
     }
 }
